@@ -354,6 +354,41 @@ where
     }
 }
 
+#[cfg(feature = "indexmap")]
+mod indexmap_conversion {
+    use super::*;
+
+    impl<K, V, H> IntoPy<PyObject> for indexmap::IndexMap<K, V, H>
+    where
+        K: hash::Hash + cmp::Eq + IntoPy<PyObject>,
+        V: IntoPy<PyObject>,
+        H: hash::BuildHasher,
+    {
+        fn into_py(self, py: Python) -> PyObject {
+            let iter = self
+                .into_iter()
+                .map(|(k, v)| (k.into_py(py), v.into_py(py)));
+            IntoPyDict::into_py_dict(iter, py).into()
+        }
+    }
+
+    impl<'source, K, V, S> FromPyObject<'source> for indexmap::IndexMap<K, V, S>
+    where
+        K: FromPyObject<'source> + cmp::Eq + hash::Hash,
+        V: FromPyObject<'source>,
+        S: hash::BuildHasher + Default,
+    {
+        fn extract(ob: &'source PyAny) -> Result<Self, PyErr> {
+            let dict = <PyDict as PyTryFrom>::try_from(ob)?;
+            let mut ret = indexmap::IndexMap::with_capacity_and_hasher(dict.len(), S::default());
+            for (k, v) in dict.iter() {
+                ret.insert(K::extract(k)?, V::extract(v)?);
+            }
+            Ok(ret)
+        }
+    }
+}
+
 #[cfg(feature = "hashbrown")]
 mod hashbrown_hashmap_conversion {
     use super::*;

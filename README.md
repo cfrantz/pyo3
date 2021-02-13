@@ -3,7 +3,7 @@
 [![Actions Status](https://github.com/PyO3/pyo3/workflows/Test/badge.svg)](https://github.com/PyO3/pyo3/actions)
 [![codecov](https://codecov.io/gh/PyO3/pyo3/branch/master/graph/badge.svg)](https://codecov.io/gh/PyO3/pyo3)
 [![crates.io](http://meritbadge.herokuapp.com/pyo3)](https://crates.io/crates/pyo3)
-[![minimum rustc 1.45](https://img.shields.io/badge/rustc-1.45+-blue.svg)](https://rust-lang.github.io/rfcs/2495-min-rust-version.html)
+[![minimum rustc 1.41](https://img.shields.io/badge/rustc-1.41+-blue.svg)](https://rust-lang.github.io/rfcs/2495-min-rust-version.html)
 [![Join the dev chat](https://img.shields.io/gitter/room/nwjs/nw.js.svg)](https://gitter.im/PyO3/Lobby)
 
 [Rust](http://www.rust-lang.org/) bindings for [Python](https://www.python.org/). This includes running and interacting with Python code from a Rust binary, as well as writing native Python modules.
@@ -18,10 +18,10 @@ A comparison with rust-cpython can be found [in the guide](https://pyo3.rs/maste
 
 ## Usage
 
-PyO3 supports Python 3.6 and up. The minimum required Rust version is 1.45.0.
+PyO3 supports Python 3.6 and up. The minimum required Rust version is 1.41.
 
 Building with PyPy is also possible (via cpyext) for Python 3.6, targeted PyPy version is 7.3+.
-Please refer to the [pypy section in the guide](https://pyo3.rs/master/pypy.html).
+Please refer to the [pypy section in the guide](https://pyo3.rs/master/building_and_distribution/pypy.html).
 
 You can either write a native Python module in Rust, or use Python from a Rust binary.
 
@@ -45,10 +45,15 @@ edition = "2018"
 
 [lib]
 name = "string_sum"
+# "cdylib" is necessary to produce a shared library for Python to import from.
+#
+# Downstream Rust code (including code in `bin/`, `examples/`, and `tests/`) will not be able
+# to `use string_sum;` unless the "rlib" or "lib" crate type is also included, e.g.:
+# crate-type = ["cdylib", "rlib"]
 crate-type = ["cdylib"]
 
 [dependencies.pyo3]
-version = "0.13.0"
+version = "0.13.2"
 features = ["extension-module"]
 ```
 
@@ -91,11 +96,6 @@ rustflags = [
 
 While developing, you can symlink (or copy) and rename the shared library from the target folder: On MacOS, rename `libstring_sum.dylib` to `string_sum.so`, on Windows `libstring_sum.dll` to `string_sum.pyd`, and on Linux `libstring_sum.so` to `string_sum.so`. Then open a Python shell in the same folder and you'll be able to `import string_sum`.
 
-Adding the `cdylib` arguments in the `Cargo.toml` files changes the way your crate is compiled.
-Other Rust projects using your crate will have to link against the `.so` or `.pyd` file rather than include your library directly as normal.
-In order to make available your crate in the usual way for Rust user, you you might want to consider using both `crate-type = ["cdylib", "rlib"]` so that Rust users can use the `rlib` (the default lib crate type).
-Another possibility is to create a new crate to perform the binding.
-
 To build, test and publish your crate as a Python module, you can use [maturin](https://github.com/PyO3/maturin) or [setuptools-rust](https://github.com/PyO3/setuptools-rust). You can find an example for setuptools-rust in [examples/word-count](https://github.com/PyO3/pyo3/tree/master/examples/word-count), while maturin should work on your crate without any configuration.
 
 ## Using Python from Rust
@@ -104,8 +104,9 @@ If you want your Rust application to create a Python interpreter internally and
 use it to run Python code, add `pyo3` to your `Cargo.toml` like this:
 
 ```toml
-[dependencies]
-pyo3 = "0.13.0"
+[dependencies.pyo3]
+version = "0.13.2"
+features = ["auto-initialize"]
 ```
 
 Example program displaying the value of `sys.version` and the current user name:
@@ -146,11 +147,12 @@ about this topic.
  * [dict-derive](https://github.com/gperinazzo/dict-derive) _Derive FromPyObject to automatically transform Python dicts into Rust structs_
  * [pyo3-log](https://github.com/vorner/pyo3-log) _Bridge from Rust to Python logging_
  * [pythonize](https://github.com/davidhewitt/pythonize) _Serde serializer for converting Rust objects to JSON-compatible Python objects_
+ * [pyo3-asyncio](https://github.com/awestlake87/pyo3-asyncio) Utilities for working with Python's Asyncio library and async functions
 
 ## Examples
 
  * [hyperjson](https://github.com/mre/hyperjson) _A hyper-fast Python module for reading/writing JSON data using Rust's serde-json_
- * [html-py-ever](https://github.com/PyO3/setuptools-rust/tree/master/html-py-ever) _Using [html5ever](https://github.com/servo/html5ever) through [kuchiki](https://github.com/kuchiki-rs/kuchiki) to speed up html parsing and css-selecting._
+ * [html-py-ever](https://github.com/PyO3/setuptools-rust/tree/master/examples/html-py-ever) _Using [html5ever](https://github.com/servo/html5ever) through [kuchiki](https://github.com/kuchiki-rs/kuchiki) to speed up html parsing and css-selecting._
  * [point-process](https://github.com/ManifoldFR/point-process-rust/tree/master/pylib) _High level API for pointprocesses as a Python library_
  * [autopy](https://github.com/autopilot-rs/autopy) _A simple, cross-platform GUI automation library for Python and Rust._
    * Contains an example of building wheels on TravisCI and appveyor using [cibuildwheel](https://github.com/joerick/cibuildwheel)
@@ -163,8 +165,9 @@ about this topic.
  * [mocpy](https://github.com/cds-astro/mocpy) _Astronomical Python library offering data structures for describing any arbitrary coverage regions on the unit sphere_
  * [tokenizers](https://github.com/huggingface/tokenizers/tree/master/bindings/python) _Python bindings to the Hugging Face tokenizers (NLP) written in Rust_
  * [pyre](https://github.com/Project-Dream-Weaver/Pyre) _Fast Python HTTP server written in Rust_
- * [jsonschema-rs](https://github.com/Stranger6667/jsonschema-rs/tree/master/python) _Fast JSON Schema validation library_
- * [css-inline](https://github.com/Stranger6667/css-inline/tree/master/python) _CSS inlining for Python implemented in Rust_
+ * [jsonschema-rs](https://github.com/Stranger6667/jsonschema-rs/tree/master/bindings/python) _Fast JSON Schema validation library_
+ * [css-inline](https://github.com/Stranger6667/css-inline/tree/master/bindings/python) _CSS inlining for Python implemented in Rust_
+ * [cryptography](https://github.com/pyca/cryptography/tree/master/src/rust) _Python cryptography library with some functionality in Rust_
 
 ## License
 

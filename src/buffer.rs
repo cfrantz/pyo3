@@ -48,7 +48,12 @@ impl ElementType {
     pub fn from_format(format: &CStr) -> ElementType {
         match format.to_bytes() {
             [char] | [b'@', char] => native_element_type_from_type_char(*char),
-            [modifier, char] if matches!(modifier, b'=' | b'<' | b'>' | b'!') => {
+            [modifier, char]
+                if (*modifier == b'='
+                    || *modifier == b'<'
+                    || *modifier == b'>'
+                    || *modifier == b'!') =>
+            {
                 standard_element_type_from_type_char(*char)
             }
             _ => ElementType::Unknown,
@@ -300,7 +305,10 @@ impl<T: Element> PyBuffer<T> {
     #[inline]
     pub fn is_c_contiguous(&self) -> bool {
         unsafe {
-            ffi::PyBuffer_IsContiguous(&*self.0 as *const ffi::Py_buffer, b'C' as libc::c_char) != 0
+            ffi::PyBuffer_IsContiguous(
+                &*self.0 as *const ffi::Py_buffer,
+                b'C' as std::os::raw::c_char,
+            ) != 0
         }
     }
 
@@ -308,7 +316,10 @@ impl<T: Element> PyBuffer<T> {
     #[inline]
     pub fn is_fortran_contiguous(&self) -> bool {
         unsafe {
-            ffi::PyBuffer_IsContiguous(&*self.0 as *const ffi::Py_buffer, b'F' as libc::c_char) != 0
+            ffi::PyBuffer_IsContiguous(
+                &*self.0 as *const ffi::Py_buffer,
+                b'F' as std::os::raw::c_char,
+            ) != 0
         }
     }
 
@@ -441,7 +452,7 @@ impl<T: Element> PyBuffer<T> {
                     target.as_ptr() as *mut raw::c_void,
                     &*self.0 as *const ffi::Py_buffer as *mut ffi::Py_buffer,
                     self.0.len,
-                    fort as libc::c_char,
+                    fort as std::os::raw::c_char,
                 ),
             )
         }
@@ -475,7 +486,7 @@ impl<T: Element> PyBuffer<T> {
                     vec.as_mut_ptr() as *mut raw::c_void,
                     &*self.0 as *const ffi::Py_buffer as *mut ffi::Py_buffer,
                     self.0.len,
-                    fort as libc::c_char,
+                    fort as std::os::raw::c_char,
                 ),
             )?;
             // set vector length to mark the now-initialized space as usable
@@ -528,7 +539,7 @@ impl<T: Element> PyBuffer<T> {
                     &*self.0 as *const ffi::Py_buffer as *mut ffi::Py_buffer,
                     source.as_ptr() as *mut raw::c_void,
                     self.0.len,
-                    fort as libc::c_char,
+                    fort as std::os::raw::c_char,
                 ),
             )
         }

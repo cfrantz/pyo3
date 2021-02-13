@@ -1,11 +1,9 @@
 //! `PyClass` and related traits.
 use crate::class::methods::{PyClassAttributeDef, PyMethodDefType, PyMethods};
 use crate::class::proto_methods::PyProtoMethods;
-use crate::conversion::{AsPyPointer, FromPyPointer};
 use crate::derive_utils::PyBaseTypeUtils;
 use crate::pyclass_slots::{PyClassDict, PyClassWeakRef};
 use crate::type_object::{type_flags, PyLayout};
-use crate::types::PyAny;
 use crate::{ffi, PyCell, PyErr, PyNativeType, PyResult, PyTypeInfo, Python};
 use std::convert::TryInto;
 use std::ffi::CString;
@@ -21,6 +19,26 @@ unsafe fn get_type_alloc(tp: *mut ffi::PyTypeObject) -> Option<ffi::allocfunc> {
 #[inline]
 pub(crate) unsafe fn get_type_free(tp: *mut ffi::PyTypeObject) -> Option<ffi::freefunc> {
     mem::transmute(ffi::PyType_GetSlot(tp, ffi::Py_tp_free))
+}
+
+/// Workaround for Python issue 35810; no longer necessary in Python 3.8
+#[inline]
+#[cfg(not(Py_3_8))]
+pub(crate) unsafe fn bpo_35810_workaround(_py: Python, ty: *mut ffi::PyTypeObject) {
+    #[cfg(Py_LIMITED_API)]
+    {
+        // Must check version at runtime for abi3 wheels - they could run against a higher version
+        // than the build config suggests.
+        use crate::once_cell::GILOnceCell;
+        static IS_PYTHON_3_8: GILOnceCell<bool> = GILOnceCell::new();
+
+        if *IS_PYTHON_3_8.get_or_init(_py, || _py.version_info() >= (3, 8)) {
+            // No fix needed - the wheel is running on a sufficiently new interpreter.
+            return;
+        }
+    }
+
+    ffi::Py_INCREF(ty as *mut ffi::PyObject);
 }
 
 #[inline]
@@ -44,8 +62,13 @@ pub(crate) unsafe fn default_new<T: PyTypeInfo>(
             unreachable!("Subclassing native types isn't support in limited API mode");
         }
     }
+
     let alloc = get_type_alloc(subtype).unwrap_or(ffi::PyType_GenericAlloc);
-    alloc(subtype, 0) as _
+
+    #[cfg(not(Py_3_8))]
+    bpo_35810_workaround(py, subtype);
+
+    alloc(subtype, 0)
 }
 
 /// This trait enables custom `tp_new`/`tp_dealloc` implementations for `T: PyClass`.
@@ -62,45 +85,37 @@ pub trait PyClassAlloc: PyTypeInfo + Sized {
     ///
     /// # Safety
     /// `self_` must be a valid pointer to the Python heap.
+    #[allow(clippy::clippy::collapsible_if)] // for if cfg!
     unsafe fn dealloc(py: Python, self_: *mut Self::Layout) {
         (*self_).py_drop(py);
-        let obj = PyAny::from_borrowed_ptr_or_panic(py, self_ as _);
+        let obj = self_ as *mut ffi::PyObject;
 
-        match get_type_free(ffi::Py_TYPE(obj.as_ptr())) {
-            Some(free) => {
-                let ty = ffi::Py_TYPE(obj.as_ptr());
-                free(obj.as_ptr() as *mut c_void);
+        let ty = ffi::Py_TYPE(obj);
+        let free = get_type_free(ty).unwrap_or_else(|| tp_free_fallback(ty));
+        free(obj as *mut c_void);
+
+        if cfg!(Py_3_8) {
+            if ffi::PyType_HasFeature(ty, ffi::Py_TPFLAGS_HEAPTYPE) != 0 {
                 ffi::Py_DECREF(ty as *mut ffi::PyObject);
             }
-            None => tp_free_fallback(obj.as_ptr()),
         }
     }
 }
 
-fn tp_dealloc<T: PyClassAlloc>() -> Option<ffi::destructor> {
-    unsafe extern "C" fn dealloc<T>(obj: *mut ffi::PyObject)
-    where
-        T: PyClassAlloc,
-    {
-        let pool = crate::GILPool::new();
-        let py = pool.python();
-        <T as PyClassAlloc>::dealloc(py, (obj as *mut T::Layout) as _)
-    }
-    Some(dealloc::<T>)
+unsafe extern "C" fn tp_dealloc<T>(obj: *mut ffi::PyObject)
+where
+    T: PyClassAlloc,
+{
+    let pool = crate::GILPool::new();
+    let py = pool.python();
+    <T as PyClassAlloc>::dealloc(py, (obj as *mut T::Layout) as _)
 }
 
-pub(crate) unsafe fn tp_free_fallback(obj: *mut ffi::PyObject) {
-    let ty = ffi::Py_TYPE(obj);
+pub(crate) unsafe fn tp_free_fallback(ty: *mut ffi::PyTypeObject) -> ffi::freefunc {
     if ffi::PyType_IS_GC(ty) != 0 {
-        ffi::PyObject_GC_Del(obj as *mut c_void);
+        ffi::PyObject_GC_Del
     } else {
-        ffi::PyObject_Free(obj as *mut c_void);
-    }
-
-    // For heap types, PyType_GenericAlloc calls INCREF on the type objects,
-    // so we need to call DECREF here:
-    if ffi::PyType_HasFeature(ty, ffi::Py_TPFLAGS_HEAPTYPE) != 0 {
-        ffi::Py_DECREF(ty as *mut ffi::PyObject);
+        ffi::PyObject_Free
     }
 }
 
@@ -134,11 +149,6 @@ impl TypeSlots {
     fn push(&mut self, slot: c_int, pfunc: *mut c_void) {
         self.0.push(ffi::PyType_Slot { slot, pfunc });
     }
-    pub(crate) fn maybe_push(&mut self, slot: c_int, value: Option<*mut c_void>) {
-        if let Some(pfunc) = value {
-            self.push(slot, pfunc);
-        }
-    }
 }
 
 fn tp_doc<T: PyClass>() -> PyResult<Option<*mut c_void>> {
@@ -171,15 +181,18 @@ where
     let mut slots = TypeSlots::default();
 
     slots.push(ffi::Py_tp_base, T::BaseType::type_object_raw(py) as _);
-    slots.maybe_push(ffi::Py_tp_doc, tp_doc::<T>()?);
-    slots.maybe_push(ffi::Py_tp_dealloc, tp_dealloc::<T>().map(|v| v as _));
+    slots.push(ffi::Py_tp_dealloc, tp_dealloc::<T> as _);
+    if let Some(doc) = tp_doc::<T>()? {
+        slots.push(ffi::Py_tp_doc, doc);
+    }
 
     let (new, call, methods) = py_class_method_defs::<T>();
-    slots.maybe_push(ffi::Py_tp_new, new.map(|v| v as _));
-    slots.maybe_push(ffi::Py_tp_call, call.map(|v| v as _));
+    slots.push(ffi::Py_tp_new, new as _);
+    if let Some(call_meth) = call {
+        slots.push(ffi::Py_tp_call, call_meth as _);
+    }
 
-    #[cfg(Py_3_9)]
-    {
+    if cfg!(Py_3_9) {
         let members = py_class_members::<T>();
         if !members.is_empty() {
             slots.push(ffi::Py_tp_members, into_raw(members))
@@ -249,18 +262,18 @@ fn tp_init_additional<T: PyClass>(type_object: *mut ffi::PyTypeObject) {
 
     // Setting buffer protocols via slots doesn't work until Python 3.9, so on older versions we
     // must manually fixup the type object.
-    #[cfg(not(Py_3_9))]
-    if let Some(buffer) = T::get_buffer() {
-        unsafe {
-            (*(*type_object).tp_as_buffer).bf_getbuffer = buffer.bf_getbuffer;
-            (*(*type_object).tp_as_buffer).bf_releasebuffer = buffer.bf_releasebuffer;
+    if cfg!(not(Py_3_9)) {
+        if let Some(buffer) = T::get_buffer() {
+            unsafe {
+                (*(*type_object).tp_as_buffer).bf_getbuffer = buffer.bf_getbuffer;
+                (*(*type_object).tp_as_buffer).bf_releasebuffer = buffer.bf_releasebuffer;
+            }
         }
     }
 
     // Setting tp_dictoffset and tp_weaklistoffset via slots doesn't work until Python 3.9, so on
     // older versions again we must fixup the type object.
-    #[cfg(not(Py_3_9))]
-    {
+    if cfg!(not(Py_3_9)) {
         // __dict__ support
         if let Some(dict_offset) = PyCell::<T>::dict_offset() {
             unsafe {
@@ -298,39 +311,34 @@ pub(crate) fn py_class_attributes<T: PyMethods>() -> impl Iterator<Item = PyClas
     })
 }
 
-fn fallback_new() -> Option<ffi::newfunc> {
-    unsafe extern "C" fn fallback_new(
-        _subtype: *mut ffi::PyTypeObject,
-        _args: *mut ffi::PyObject,
-        _kwds: *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject {
-        crate::callback_body!(py, {
-            Err::<(), _>(crate::exceptions::PyTypeError::new_err(
-                "No constructor defined",
-            ))
-        })
-    }
-    Some(fallback_new)
+unsafe extern "C" fn fallback_new(
+    _subtype: *mut ffi::PyTypeObject,
+    _args: *mut ffi::PyObject,
+    _kwds: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    crate::callback_body!(py, {
+        Err::<(), _>(crate::exceptions::PyTypeError::new_err(
+            "No constructor defined",
+        ))
+    })
 }
 
 fn py_class_method_defs<T: PyMethods>() -> (
-    Option<ffi::newfunc>,
+    ffi::newfunc,
     Option<ffi::PyCFunctionWithKeywords>,
     Vec<ffi::PyMethodDef>,
 ) {
     let mut defs = Vec::new();
     let mut call = None;
-    let mut new = fallback_new();
+    let mut new = fallback_new as ffi::newfunc;
 
     for def in T::py_methods() {
         match def {
             PyMethodDefType::New(def) => {
-                new = def.get_new_func();
-                debug_assert!(new.is_some());
+                new = def.ml_meth;
             }
             PyMethodDefType::Call(def) => {
-                call = def.get_cfunction_with_keywords();
-                debug_assert!(call.is_some());
+                call = Some(def.ml_meth);
             }
             PyMethodDefType::Method(def)
             | PyMethodDefType::Class(def)
@@ -384,6 +392,13 @@ fn py_class_members<T: PyClass>() -> Vec<ffi::structmember::PyMemberDef> {
     members
 }
 
+// Stub needed since the `if cfg!()` above still compiles contained code.
+#[cfg(not(Py_3_9))]
+fn py_class_members<T: PyClass>() -> Vec<ffi::structmember::PyMemberDef> {
+    vec![]
+}
+
+#[allow(clippy::clippy::collapsible_if)] // for if cfg!
 fn py_class_properties<T: PyClass>() -> Vec<ffi::PyGetSetDef> {
     let mut defs = std::collections::HashMap::new();
 
@@ -413,7 +428,16 @@ fn py_class_properties<T: PyClass>() -> Vec<ffi::PyGetSetDef> {
 
     // PyPy doesn't automatically adds __dict__ getter / setter.
     // PyObject_GenericGetDict not in the limited API until Python 3.10.
-    #[cfg(not(any(PyPy, all(Py_LIMITED_API, not(Py_3_10)))))]
+    push_dict_getset::<T>(&mut props);
+
+    if !props.is_empty() {
+        props.push(unsafe { std::mem::zeroed() });
+    }
+    props
+}
+
+#[cfg(not(any(PyPy, all(Py_LIMITED_API, not(Py_3_10)))))]
+fn push_dict_getset<T: PyClass>(props: &mut Vec<ffi::PyGetSetDef>) {
     if !T::Dict::IS_DUMMY {
         props.push(ffi::PyGetSetDef {
             name: "__dict__\0".as_ptr() as *mut c_char,
@@ -423,11 +447,10 @@ fn py_class_properties<T: PyClass>() -> Vec<ffi::PyGetSetDef> {
             closure: ptr::null_mut(),
         });
     }
-    if !props.is_empty() {
-        props.push(unsafe { std::mem::zeroed() });
-    }
-    props
 }
+
+#[cfg(any(PyPy, all(Py_LIMITED_API, not(Py_3_10))))]
+fn push_dict_getset<T: PyClass>(_: &mut Vec<ffi::PyGetSetDef>) {}
 
 /// This trait is implemented for `#[pyclass]` and handles following two situations:
 /// 1. In case `T` is `Send`, stub `ThreadChecker` is used and does nothing.

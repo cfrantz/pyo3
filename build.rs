@@ -488,7 +488,7 @@ fn load_cross_compile_from_headers(
     let interpreter_config = InterpreterConfig {
         version: python_version,
         libdir: cross_compile_config.lib_dir.to_str().map(String::from),
-        shared: config_data.get_bool("Py_ENABLE_SHARED")?,
+        shared: config_data.get_bool("Py_ENABLE_SHARED").unwrap_or(false),
         ld_version: format!("{}.{}", major, minor),
         base_prefix: "".to_string(),
         executable: PathBuf::new(),
@@ -560,9 +560,20 @@ fn load_cross_compile_info(
 /// Run a python script using the specified interpreter binary.
 fn run_python_script(interpreter: &Path, script: &str) -> Result<String> {
     let out = Command::new(interpreter)
-        .args(&["-c", script])
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output();
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())?;
+            child.wait_with_output()
+        });
 
     match out {
         Err(err) => {
@@ -580,24 +591,32 @@ fn run_python_script(interpreter: &Path, script: &str) -> Result<String> {
                 );
             }
         }
-        Ok(ok) if !ok.status.success() => bail!("Python script failed: {}"),
+        Ok(ok) if !ok.status.success() => bail!("Python script failed"),
         Ok(ok) => Ok(String::from_utf8(ok.stdout)?),
     }
 }
 
 fn get_rustc_link_lib(config: &InterpreterConfig) -> String {
     let link_name = if env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() == "windows" {
-        // Link against python3.lib for the stable ABI on Windows.
-        // See https://www.python.org/dev/peps/pep-0384/#linkage
-        //
-        // This contains only the limited ABI symbols.
-        if env::var_os("CARGO_FEATURE_ABI3").is_some() {
-            "pythonXY:python3".to_owned()
-        } else {
+        if env::var("CARGO_CFG_TARGET_ENV").unwrap().as_str() == "gnu" {
+            // https://packages.msys2.org/base/mingw-w64-python
             format!(
-                "pythonXY:python{}{}",
+                "pythonXY:python{}.{}",
                 config.version.major, config.version.minor
             )
+        } else {
+            // Link against python3.lib for the stable ABI on Windows.
+            // See https://www.python.org/dev/peps/pep-0384/#linkage
+            //
+            // This contains only the limited ABI symbols.
+            if env::var_os("CARGO_FEATURE_ABI3").is_some() {
+                "pythonXY:python3".to_owned()
+            } else {
+                format!(
+                    "pythonXY:python{}{}",
+                    config.version.major, config.version.minor
+                )
+            }
         }
     } else {
         match config.version.implementation {
@@ -749,6 +768,10 @@ fn configure(interpreter_config: &InterpreterConfig) -> Result<()> {
         }
     }
 
+    if interpreter_config.shared {
+        println!("cargo:rustc-cfg=Py_SHARED");
+    }
+
     if interpreter_config.version.implementation == PythonInterpreterKind::PyPy {
         println!("cargo:rustc-cfg=PyPy");
     };
@@ -827,11 +850,21 @@ fn abi3_without_interpreter() -> Result<()> {
     }
     println!("cargo:rustc-cfg=py_sys_config=\"WITH_THREAD\"");
     println!("cargo:python_flags={}", flags);
+
+    // Unfortunately, on windows we can't build without at least providing
+    // python.lib to the linker. While maturin tells the linker the location
+    // of python.lib, we need to do the renaming here, otherwise cargo
+    // complains that the crate using pyo3 does not contains a `#[link(...)]`
+    // attribute with pythonXY.
+    if env::var("CARGO_CFG_TARGET_FAMILY")? == "windows" {
+        println!("cargo:rustc-link-lib=pythonXY:python3");
+    }
+
     Ok(())
 }
 
 fn main() -> Result<()> {
-    // If PYO3_NO_PYTHON is set with abi3, we can build PyO3 without calling Python (UNIX only).
+    // If PYO3_NO_PYTHON is set with abi3, we can build PyO3 without calling Python.
     // We only check for the abi3-py3{ABI3_MAX_MINOR} because lower versions depend on it.
     if env::var_os("PYO3_NO_PYTHON").is_some()
         && env::var_os(format!("CARGO_FEATURE_ABI3_PY3{}", ABI3_MAX_MINOR)).is_some()
@@ -881,6 +914,12 @@ fn main() -> Result<()> {
             // Let's watch this, too.
             println!("cargo:rerun-if-env-changed=PATH");
         }
+    }
+
+    // TODO: this is a hack to workaround compile_error! warnings about auto-initialize on PyPy
+    // Once cargo's `resolver = "2"` is stable (~ MSRV Rust 1.52), remove this.
+    if env::var_os("PYO3_CI").is_some() {
+        println!("cargo:rustc-cfg=__pyo3_ci");
     }
 
     Ok(())

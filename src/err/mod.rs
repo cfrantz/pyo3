@@ -11,11 +11,11 @@ use crate::{
     AsPyPointer, FromPyPointer, IntoPy, Py, PyAny, PyNativeType, PyObject, Python,
     ToBorrowedObject, ToPyObject,
 };
-use libc::c_int;
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::os::raw::c_int;
 use std::ptr::NonNull;
 
 mod err_state;
@@ -594,12 +594,8 @@ mod tests {
         assert!(debug_str.starts_with("PyErr { "));
         assert!(debug_str.ends_with(" }"));
 
-        let mut fields = debug_str
-            .strip_prefix("PyErr { ")
-            .unwrap()
-            .strip_suffix(" }")
-            .unwrap()
-            .split(", ");
+        // strip "PyErr { " and " }"
+        let mut fields = debug_str["PyErr { ".len()..debug_str.len() - 2].split(", ");
 
         assert_eq!(fields.next().unwrap(), "type: <class 'Exception'>");
         if py.version_info() >= (3, 7) {
